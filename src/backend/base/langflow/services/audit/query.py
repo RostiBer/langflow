@@ -43,7 +43,7 @@ class AuditCursorError(ValueError):
     """A cursor that is malformed or was issued for different filters."""
 
 
-def _utc(value: datetime) -> datetime:
+def to_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
@@ -78,8 +78,8 @@ class AuditEventFilters:
             "acting_issuer": self.acting_issuer,
             "acting_subject": self.acting_subject,
             "request_id": str(self.request_id) if self.request_id else None,
-            "since": _utc(self.since).isoformat() if self.since else None,
-            "until": _utc(self.until).isoformat() if self.until else None,
+            "since": to_utc(self.since).isoformat() if self.since else None,
+            "until": to_utc(self.until).isoformat() if self.until else None,
         }
         encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
@@ -105,20 +105,20 @@ class AuditEventFilters:
             col(column).in_(sorted(value.value for value in values)) for column, values in any_of.items() if values
         )
         if self.since is not None:
-            clauses.append(col(AuditEvent.timestamp) >= _utc(self.since))
+            clauses.append(col(AuditEvent.timestamp) >= to_utc(self.since))
         if self.until is not None:
-            clauses.append(col(AuditEvent.timestamp) < _utc(self.until))
+            clauses.append(col(AuditEvent.timestamp) < to_utc(self.until))
         return clauses
 
 
 @dataclass(frozen=True)
-class _CursorState:
+class CursorState:
     fingerprint: str
     timestamp: datetime
     event_id: UUID
 
 
-def encode_cursor(state: _CursorState) -> str:
+def encode_cursor(state: CursorState) -> str:
     payload = {
         "v": CURSOR_VERSION,
         "f": state.fingerprint,
@@ -129,14 +129,19 @@ def encode_cursor(state: _CursorState) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def decode_cursor(cursor: str, filters: AuditEventFilters) -> _CursorState:
+def decode_cursor(cursor: str, filters: AuditEventFilters) -> CursorState:
     """Read a cursor back, refusing one that belongs to another traversal."""
+    return decode_state(cursor, filters.fingerprint())
+
+
+def decode_state(cursor: str, fingerprint: str) -> CursorState:
+    """Read a cursor back for the traversal whose filters hash to ``fingerprint``."""
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
         payload = json.loads(raw.decode("utf-8"))
-        state = _CursorState(
+        state = CursorState(
             fingerprint=str(payload["f"]),
-            timestamp=_utc(datetime.fromisoformat(payload["t"])),
+            timestamp=to_utc(datetime.fromisoformat(payload["t"])),
             event_id=UUID(payload["i"]),
         )
         version = payload["v"]
@@ -146,7 +151,7 @@ def decode_cursor(cursor: str, filters: AuditEventFilters) -> _CursorState:
     if version != CURSOR_VERSION:
         msg = "Unsupported cursor version"
         raise AuditCursorError(msg)
-    if state.fingerprint != filters.fingerprint():
+    if state.fingerprint != fingerprint:
         msg = "Cursor was issued for different filters"
         raise AuditCursorError(msg)
     return state
@@ -200,7 +205,7 @@ async def list_audit_events(
     items = rows[:limit]
     last = items[-1]
     next_cursor = encode_cursor(
-        _CursorState(
+        CursorState(
             fingerprint=filters.fingerprint(),
             timestamp=as_utc(last.timestamp),
             event_id=last.id,
