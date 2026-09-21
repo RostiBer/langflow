@@ -157,6 +157,20 @@ def decode_state(cursor: str, fingerprint: str) -> CursorState:
     return state
 
 
+def keyset_after(model: Any, state: CursorState) -> ColumnElement[bool]:
+    """Rows after ``state`` in ``(timestamp DESC, id DESC)`` order.
+
+    The leading ``timestamp <=`` bound is implied by the rest but is what lets an
+    index on the timestamp start the scan at the cursor. Without it the database
+    reads every newer row and discards it, so each page costs its depth.
+    """
+    timestamp, event_id = col(model.timestamp), col(model.id)
+    return and_(
+        timestamp <= state.timestamp,
+        or_(timestamp < state.timestamp, and_(timestamp == state.timestamp, event_id < state.event_id)),
+    )
+
+
 @dataclass(frozen=True)
 class AuditEventPage:
     items: list[AuditEvent]
@@ -185,12 +199,7 @@ async def list_audit_events(
 
     if cursor is not None:
         state = decode_cursor(cursor, filters)
-        clauses.append(
-            or_(
-                col(AuditEvent.timestamp) < state.timestamp,
-                and_(col(AuditEvent.timestamp) == state.timestamp, col(AuditEvent.id) < state.event_id),
-            )
-        )
+        clauses.append(keyset_after(AuditEvent, state))
 
     statement = (
         select(AuditEvent)
